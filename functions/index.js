@@ -1,45 +1,25 @@
 "use strict";
 
-const shouldCompress = require("../util/shouldCompress");
-const compress = require("../util/compress");
-const {
-  isValidUrl,
-  isPrivateHost,
-} = require("../util/validate");
-const {
-  fetchWithRedirectCheck,
-} = require("../util/fetch");
+const sharp = require("sharp");
 
 const DEFAULT_QUALITY = 40;
-const DEFAULT_TIMEOUT_MS = 8000;
-const MAX_INPUT_BYTES = 15 * 1024 * 1024;
+const DEFAULT_MAX_WIDTH = 0;
+const FETCH_TIMEOUT_MS = 10_000;
 const MAX_REDIRECTS = 5;
-const MAX_WIDTH = 8192;
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, OPTIONS",
   "access-control-allow-headers": "*",
-  "access-control-expose-headers":
-    "content-type, content-length, cache-control, " +
-    "x-bh-original-size, x-bh-compressed-size, x-bh-bytes-saved",
 };
 
 const CACHE_HEADERS = {
-  "netlify-cdn-cache-control":
-    "public, durable, s-maxage=604800, stale-while-revalidate=86400",
-  "cache-control": "public, max-age=0, must-revalidate",
-  "netlify-vary": "query=url|quality|bw|jpeg|max_width|l",
+  "cache-control":
+    "public, s-maxage=604800, max-age=3600, stale-while-revalidate=86400",
 };
 
-const BACKEND_HEADERS = {
-  "x-bh-backend": "bandwidth-proxy-2",
-  "x-bh-version": "2.1.0",
-  "x-bh-api": "1",
-  "x-bh-features": "webp,grayscale,maxwidth,stats",
-};
-
-const UPSTREAM_HEADER_DENYLIST = new Set([
+const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
   "proxy-authenticate",
@@ -48,22 +28,12 @@ const UPSTREAM_HEADER_DENYLIST = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
-  "cache-control",
   "content-encoding",
   "content-length",
-  "content-range",
-  "set-cookie",
-  "strict-transport-security",
-  "age",
-  "via",
-  "alt-svc",
-  "server",
-  "location",
-  "cf-cache-status",
-  "cf-ray",
+  "content-type",
 ]);
 
-function response(statusCode, body, headers = {}) {
+function response(statusCode, body = "", headers = {}) {
   return {
     statusCode,
     headers: {
@@ -74,218 +44,446 @@ function response(statusCode, body, headers = {}) {
   };
 }
 
-function numberInRange(value, fallback, min, max) {
+function base64Response(buffer, headers = {}) {
+  return {
+    statusCode: 200,
+    isBase64Encoded: true,
+    body: buffer.toString("base64"),
+    headers: {
+      ...CORS_HEADERS,
+      ...CACHE_HEADERS,
+      ...headers,
+    },
+  };
+}
+
+function getQueryParameters(event) {
+  return event.queryStringParameters || {};
+}
+
+function getImageUrl(value) {
+  if (!value) return "";
+
+  if (Array.isArray(value)) {
+    return value.join("&url=");
+  }
+
+  // Compatibility with older Bandwidth Hero clients that send a JSON string.
+  try {
+    const parsed = JSON.parse(value);
+
+    if (Array.isArray(parsed)) {
+      return parsed.join("&url=");
+    }
+
+    if (typeof parsed === "string") {
+      return parsed;
+    }
+  } catch {
+    // Normal URL; no JSON decoding needed.
+  }
+
+  return value;
+}
+
+function normalizeImageUrl(value) {
+  let imageUrl = getImageUrl(value).trim();
+
+  // Legacy Bandwidth Hero image proxy URL format.
+  imageUrl = imageUrl.replace(
+    /^http:\/\/1\.1\.\d+\.\d+\/bmi\/(https?:\/\/)?/i,
+    "http://"
+  );
+
+  return imageUrl;
+}
+
+function parseHttpUrl(value) {
+  try {
+    const parsed = new URL(value);
+
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isPrivateHostname(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+
+  if (
+    host === "localhost" ||
+    host === "localhost.localdomain" ||
+    host === "::1" ||
+    host === "0.0.0.0"
+  ) {
+    return true;
+  }
+
+  // IPv4 private, loopback, link-local, carrier-grade NAT and multicast ranges.
+  const ipv4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+
+    if (octets.some((part) => part < 0 || part > 255)) {
+      return true;
+    }
+
+    const [a, b] = octets;
+
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
+    );
+  }
+
+  // IPv6 loopback, unique-local and link-local ranges.
+  return (
+    host.startsWith("fc") ||
+    host.startsWith("fd") ||
+    host.startsWith("fe8") ||
+    host.startsWith("fe9") ||
+    host.startsWith("fea") ||
+    host.startsWith("feb")
+  );
+}
+
+function validateRemoteUrl(value) {
+  const parsed = parseHttpUrl(value);
+
+  if (!parsed) {
+    return {
+      valid: false,
+      error: "Invalid URL. Only HTTP and HTTPS URLs are supported.",
+    };
+  }
+
+  if (isPrivateHostname(parsed.hostname)) {
+    return {
+      valid: false,
+      error: "Requests to private or local addresses are not allowed.",
+    };
+  }
+
+  return {
+    valid: true,
+    url: parsed.toString(),
+  };
+}
+
+function getNumber(value, fallback, min, max) {
   const number = Number.parseInt(value, 10);
 
   if (!Number.isFinite(number)) {
     return fallback;
   }
 
-  return Math.min(max, Math.max(min, number));
+  return Math.min(Math.max(number, min), max);
 }
 
-function getQuery(event) {
-  return event.queryStringParameters || {};
+function getBoolean(value) {
+  return value === "1" || value === "true";
 }
 
-function getImageUrl(value) {
-  if (!value) {
-    return null;
+function getForwardedHeaders(event) {
+  const input = event.headers || {};
+  const headers = {};
+
+  const cookie = input.cookie;
+  const referer = input.referer || input.referrer;
+  const userAgent = input["user-agent"];
+  const acceptLanguage = input["accept-language"];
+
+  if (cookie) headers.cookie = cookie;
+  if (referer) headers.referer = referer;
+  if (userAgent) headers["user-agent"] = userAgent;
+  if (acceptLanguage) headers["accept-language"] = acceptLanguage;
+
+  headers.accept =
+    input.accept || "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
+
+  // Do not request compressed transfer encoding. Sharp needs the decoded body.
+  headers["accept-encoding"] = "identity";
+
+  return headers;
+}
+
+function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  return fetch(url, {
+    ...options,
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
+}
+
+async function fetchImage(event, initialUrl) {
+  let currentUrl = initialUrl;
+
+  for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
+    const validation = validateRemoteUrl(currentUrl);
+
+    if (!validation.valid) {
+      const error = new Error(validation.error);
+      error.statusCode = 403;
+      throw error;
+    }
+
+    const upstream = await fetchWithTimeout(
+      currentUrl,
+      {
+        method: "GET",
+        headers: getForwardedHeaders(event),
+        redirect: "manual",
+      },
+      FETCH_TIMEOUT_MS
+    );
+
+    if (
+      upstream.status >= 300 &&
+      upstream.status < 400 &&
+      upstream.headers.get("location")
+    ) {
+      if (redirect === MAX_REDIRECTS) {
+        const error = new Error("Too many upstream redirects.");
+        error.statusCode = 508;
+        throw error;
+      }
+
+      const nextUrl = new URL(
+        upstream.headers.get("location"),
+        currentUrl
+      ).toString();
+
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (!upstream.ok) {
+      const error = new Error(
+        `Upstream image request failed with status ${upstream.status}.`
+      );
+      error.statusCode = upstream.status >= 400 ? upstream.status : 502;
+      throw error;
+    }
+
+    const contentType = (
+      upstream.headers.get("content-type") || ""
+    ).split(";")[0].toLowerCase();
+
+    if (!contentType.startsWith("image/")) {
+      const error = new Error(
+        `Upstream returned a non-image response (${contentType || "unknown"}).`
+      );
+      error.statusCode = 415;
+      throw error;
+    }
+
+    const contentLength = Number.parseInt(
+      upstream.headers.get("content-length") || "",
+      10
+    );
+
+    if (contentLength > MAX_IMAGE_BYTES) {
+      const error = new Error("The source image is too large.");
+      error.statusCode = 413;
+      throw error;
+    }
+
+    const arrayBuffer = await upstream.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (buffer.length > MAX_IMAGE_BYTES) {
+      const error = new Error("The source image is too large.");
+      error.statusCode = 413;
+      throw error;
+    }
+
+    return {
+      buffer,
+      contentType,
+      headers: upstream.headers,
+    };
   }
 
-  let url = value;
-
-  try {
-    const parsed = JSON.parse(value);
-    url = Array.isArray(parsed)
-      ? parsed.join("&url=")
-      : typeof parsed === "string"
-        ? parsed
-        : value;
-  } catch {
-    // The extension normally sends a plain URL.
-  }
-
-  return String(url)
-    .replace(
-      /http:\/\/1\.1\.\d+\.\d+\/bmi\/(https?:\/\/)?/i,
-      "http://"
-    )
-    .trim();
+  throw new Error("Unable to fetch image.");
 }
 
-function copyUpstreamHeaders(headers) {
+function getSafeUpstreamHeaders(headers) {
   const result = {};
 
-  headers.forEach((value, key) => {
-    if (!UPSTREAM_HEADER_DENYLIST.has(key.toLowerCase())) {
-      result[key] = value;
+  for (const [key, value] of headers.entries()) {
+    const normalizedKey = key.toLowerCase();
+
+    if (!HOP_BY_HOP_HEADERS.has(normalizedKey)) {
+      result[normalizedKey] = value;
     }
-  });
+  }
 
   return result;
 }
 
-function requestHeaders(event) {
-  const headers = event.headers || {};
-  const get = (name) => headers[name] || headers[name.toLowerCase()];
+async function compressImage(
+  input,
+  useWebp,
+  grayscale,
+  quality,
+  maxWidth
+) {
+  const format = useWebp ? "webp" : "jpeg";
 
-  return {
-    ...(get("cookie") && { cookie: get("cookie") }),
-    ...(get("dnt") && { dnt: get("dnt") }),
-    ...(get("referer") && { referer: get("referer") }),
-    "user-agent":
-      get("user-agent") ||
-      "Mozilla/5.0 (compatible; BandwidthHeroProxy/2.1)",
-    accept:
-      get("accept") ||
-      "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    "accept-language": get("accept-language") || "en-US,en;q=0.9",
-    "accept-encoding": "identity",
-  };
+  let pipeline = sharp(input, {
+    animated: false,
+    failOn: "none",
+  }).rotate();
+
+  if (maxWidth > 0) {
+    pipeline = pipeline.resize({
+      width: maxWidth,
+      fit: "inside",
+      withoutEnlargement: true,
+      fastShrinkOnLoad: true,
+    });
+  }
+
+  if (grayscale) {
+    pipeline = pipeline.grayscale();
+  }
+
+  if (useWebp) {
+    pipeline = pipeline.webp({
+      quality,
+      effort: 4,
+      smartSubsample: true,
+    });
+  } else {
+    pipeline = pipeline.jpeg({
+      quality,
+      progressive: true,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    });
+  }
+
+  return pipeline.toBuffer();
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") {
-    return response(204, "");
+  const method = event.httpMethod || "GET";
+
+  if (method === "OPTIONS") {
+    return response(204);
   }
 
-  const query = getQuery(event);
-  const rawUrl = getImageUrl(query.url);
+  if (method !== "GET") {
+    return response(405, "Method Not Allowed", {
+      allow: "GET, OPTIONS",
+    });
+  }
 
-  if (!rawUrl) {
+  const query = getQueryParameters(event);
+
+  // Bandwidth Hero uses this response to test whether the proxy is available.
+  if (!query.url) {
     return response(200, "bandwidth-hero-proxy");
   }
 
-  if (!isValidUrl(rawUrl)) {
-    return response(400, "Invalid URL");
-  }
+  const imageUrl = normalizeImageUrl(query.url);
+  const validation = validateRemoteUrl(imageUrl);
 
-  const parsedUrl = new URL(rawUrl);
-
-  if (isPrivateHost(parsedUrl.hostname)) {
-    return response(403, "Forbidden");
+  if (!validation.valid) {
+    return response(400, validation.error);
   }
 
   const useWebp = query.jpeg !== "1";
-  const grayscale = query.bw === "1";
-  const quality = numberInRange(
+  const grayscale = getBoolean(query.bw);
+
+  // Supports both Bandwidth Guardian and the original Bandwidth Hero parameter.
+  const quality = getNumber(
     query.quality || query.l,
     DEFAULT_QUALITY,
     1,
     100
   );
-  const maxWidth = numberInRange(query.max_width, 0, 0, MAX_WIDTH);
+
+  const maxWidth = getNumber(
+    query.max_width,
+    DEFAULT_MAX_WIDTH,
+    0,
+    8192
+  );
 
   try {
-    const upstream = await fetchWithRedirectCheck(
-      rawUrl,
-      {
-        headers: requestHeaders(event),
-        timeout: DEFAULT_TIMEOUT_MS,
-        maxBytes: MAX_INPUT_BYTES,
-      },
-      MAX_REDIRECTS
-    );
+    const source = await fetchImage(event, validation.url);
+    const originalSize = source.buffer.length;
 
-    if (!upstream.ok) {
-      return response(upstream.status || 502, "");
-    }
-
-    const contentType =
-      upstream.headers.get("content-type") || "application/octet-stream";
-
-    if (!contentType.toLowerCase().startsWith("image/")) {
-      return response(
-        415,
-        `Upstream returned non-image response (${contentType})`
-      );
-    }
-
-    const contentLength = Number.parseInt(
-      upstream.headers.get("content-length"),
-      10
-    );
-
-    if (contentLength > MAX_INPUT_BYTES) {
-      return response(413, "Image is too large");
-    }
-
-    const body = Buffer.from(await upstream.arrayBuffer());
-
-    if (body.length > MAX_INPUT_BYTES) {
-      return response(413, "Image is too large");
-    }
-
-    const originalSize = body.length;
-    const upstreamHeaders = copyUpstreamHeaders(upstream.headers);
-
-    if (!shouldCompress(contentType, originalSize, useWebp)) {
-      return {
-        statusCode: 200,
-        isBase64Encoded: true,
-        body: body.toString("base64"),
-        headers: {
-          ...CORS_HEADERS,
-          ...CACHE_HEADERS,
-          ...upstreamHeaders,
-          "content-type": contentType,
-          "content-encoding": "identity",
-          ...BACKEND_HEADERS,
-          "x-bh-original-size": String(originalSize),
-          "x-bh-compressed-size": String(originalSize),
-          "x-bh-bytes-saved": "0",
-        },
-      };
-    }
-
-    const result = await compress(
-      body,
+    const compressed = await compressImage(
+      source.buffer,
       useWebp,
       grayscale,
       quality,
-      originalSize,
       maxWidth
     );
 
-    if (result.err) {
-      throw result.err;
+    // Never increase bandwidth usage. Return the original image when compression
+    // produces an equal or larger file.
+    if (compressed.length >= originalSize) {
+      return base64Response(
+        source.buffer,
+        {
+          ...CACHE_HEADERS,
+          ...getSafeUpstreamHeaders(source.headers),
+          "content-type": source.contentType,
+          "content-length": String(originalSize),
+          "content-encoding": "identity",
+          "x-original-size": String(originalSize),
+          "x-compressed-size": String(originalSize),
+          "x-bytes-saved": "0",
+        }
+      );
     }
 
-    return {
-      statusCode: 200,
-      isBase64Encoded: true,
-      body: result.output.toString("base64"),
-      headers: {
-        ...CORS_HEADERS,
-        ...CACHE_HEADERS,
-        ...upstreamHeaders,
-        ...result.headers,
-        "content-encoding": "identity",
-        ...BACKEND_HEADERS,
-      },
-    };
+    const outputType = useWebp ? "image/webp" : "image/jpeg";
+    const bytesSaved = originalSize - compressed.length;
+
+    return base64Response(compressed, {
+      "content-type": outputType,
+      "content-length": String(compressed.length),
+      "content-encoding": "identity",
+      "x-original-size": String(originalSize),
+      "x-compressed-size": String(compressed.length),
+      "x-bytes-saved": String(bytesSaved),
+    });
   } catch (error) {
-    if (error.message === "FETCH_TIMEOUT") {
-      return response(504, "Upstream fetch timed out");
-    }
+    console.error("Image proxy error:", error);
 
-    if (error.message === "MAX_RESPONSE_SIZE_EXCEEDED") {
-      return response(413, "Image is too large");
-    }
+    const statusCode =
+      Number.isInteger(error.statusCode) &&
+      error.statusCode >= 400 &&
+      error.statusCode <= 599
+        ? error.statusCode
+        : error.name === "AbortError"
+          ? 504
+          : 500;
 
-    if (
-      error.message === "FORBIDDEN_PRIVATE_REDIRECT" ||
-      error.message === "INVALID_REDIRECT_URL"
-    ) {
-      return response(403, "Forbidden");
-    }
+    const message =
+      error.name === "AbortError"
+        ? "Upstream image request timed out."
+        : error.message || "Image processing failed.";
 
-    if (error.message === "MAX_REDIRECTS_EXCEEDED") {
-      return response(508, "Too many redirects");
-    }
-
-    console.error("Proxy error:", error);
-    return response(502, "Unable to fetch or process image");
+    return response(statusCode, message);
   }
 };
