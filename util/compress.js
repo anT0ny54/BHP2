@@ -1,36 +1,66 @@
+"use strict";
+
 const sharp = require("sharp");
 
-function compress(input, useWebp, grayscale, quality, originalSize, maxWidth) {
+function compress(
+  input,
+  useWebp,
+  grayscale,
+  quality,
+  originalSize,
+  maxWidth
+) {
   const format = useWebp ? "webp" : "jpeg";
-
-  let pipeline = sharp(input);
+  let pipeline = sharp(input, {
+    failOn: "none",
+    limitInputPixels: 268402689,
+  });
 
   if (maxWidth > 0) {
     pipeline = pipeline.resize({
-      width:              maxWidth,
+      width: maxWidth,
+      fit: "inside",
       withoutEnlargement: true,
-      fit:                "inside",
+      fastShrinkOnLoad: true,
     });
   }
 
-  // progressive + optimizeScans require a multi-pass encode — removed.
-  // For a proxy that returns the full image in one response, baseline encoding
-  // is faster with no quality difference perceived by the end user.
+  if (grayscale) {
+    pipeline = pipeline.grayscale();
+  }
+
+  const formatOptions = useWebp
+    ? {
+        quality,
+        effort: 3,
+        smartSubsample: true,
+      }
+    : {
+        quality,
+        progressive: true,
+        mozjpeg: true,
+        chromaSubsampling: "4:2:0",
+      };
+
   return pipeline
-    .grayscale(grayscale)
-    .toFormat(format, { quality })
-    .toBuffer({ resolveWithObject: true })
-    .then(({ data, info }) => ({
+    .toFormat(format, formatOptions)
+    .toBuffer()
+    .then((output) => ({
       err: null,
+      output,
       headers: {
-        "content-type":    `image/${format}`,
-        "content-length":  info.size,
-        "x-original-size": originalSize,
-        "x-bytes-saved":   originalSize - info.size,
+        "content-type": `image/${format}`,
+        "content-length": String(output.length),
+        "x-bh-original-size": String(originalSize),
+        "x-bh-compressed-size": String(output.length),
+        "x-bh-bytes-saved": String(originalSize - output.length),
       },
-      output: data,
     }))
-    .catch((err) => ({ err }));
+    .catch((err) => ({
+      err,
+      output: null,
+      headers: {},
+    }));
 }
 
 module.exports = compress;

@@ -1,70 +1,110 @@
+"use strict";
+
 const { isValidUrl, isPrivateHost } = require("./validate");
 
-/**
- * Custom fetch that securely follows redirects up to maxRedirects depth.
- * Verifies redirect targets are valid and non-private (SSRF mitigation).
- *
- * A single AbortController is created before the redirect loop so the timeout
- * is a wall-clock deadline for the entire chain — not reset on every hop.
- */
-async function fetchWithRedirectCheck(url, options = {}, maxRedirects = 5) {
+async function fetchWithRedirectCheck(
+  url,
+  options = {},
+  maxRedirects = 5
+) {
   let currentUrl = url;
   let redirectCount = 0;
-
   const timeoutMs = options.timeout || 8000;
-  const { timeout, ...fetchOptions } = options;
+  const maxBytes = options.maxBytes || 15 * 1024 * 1024;
+  const { timeout, maxBytes: unused, ...fetchOptions } = options;
+
   fetchOptions.redirect = "manual";
 
-  // One controller, one timer for the whole redirect chain.
   const controller = new AbortController();
-  const timerId = setTimeout(() => controller.abort(), timeoutMs);
-  fetchOptions.signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     while (true) {
-      const response = await fetch(currentUrl, fetchOptions);
-      const status = response.status;
+      const response = await fetch(currentUrl, {
+        ...fetchOptions,
+        signal: controller.signal,
+      });
 
-      if (status >= 300 && status < 400) {
-        redirectCount++;
+      if (response.status >= 300 && response.status < 400) {
+        redirectCount += 1;
+
         if (redirectCount > maxRedirects) {
           throw new Error("MAX_REDIRECTS_EXCEEDED");
         }
 
         const location = response.headers.get("location");
+
         if (!location) {
           throw new Error("REDIRECT_MISSING_LOCATION");
         }
 
-        // Resolve absolute or relative redirect URL.
-        const resolvedUrl = new URL(location, currentUrl).toString();
+        const nextUrl = new URL(location, currentUrl).toString();
 
-        if (!isValidUrl(resolvedUrl)) {
+        if (!isValidUrl(nextUrl)) {
           throw new Error("INVALID_REDIRECT_URL");
         }
 
-        const parsedUrl = new URL(resolvedUrl);
-        if (isPrivateHost(parsedUrl.hostname)) {
+        const nextHost = new URL(nextUrl).hostname;
+
+        if (isPrivateHost(nextHost)) {
           throw new Error("FORBIDDEN_PRIVATE_REDIRECT");
         }
 
-        currentUrl = resolvedUrl;
+        currentUrl = nextUrl;
         continue;
       }
 
-      return response;
+      const contentLength = Number.parseInt(
+        response.headers.get("content-length"),
+        10
+      );
+
+      if (contentLength > maxBytes) {
+        throw new Error("MAX_RESPONSE_SIZE_EXCEEDED");
+      }
+
+      if (!response.body || typeof response.body.getReader !== "function") {
+        return response;
+      }
+
+      const reader = response.body.getReader();
+      const chunks = [];
+      let total = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        total += value.byteLength;
+
+        if (total > maxBytes) {
+          await reader.cancel();
+          throw new Error("MAX_RESPONSE_SIZE_EXCEEDED");
+        }
+
+        chunks.push(Buffer.from(value));
+      }
+
+      return new Response(Buffer.concat(chunks), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
     }
-  } catch (err) {
-    if (err.name === "AbortError") {
+  } catch (error) {
+    if (error.name === "AbortError") {
       throw new Error("FETCH_TIMEOUT");
     }
-    throw err;
+
+    throw error;
   } finally {
-    // Always clear the timer whether the fetch succeeded, failed, or timed out.
-    clearTimeout(timerId);
+    clearTimeout(timer);
   }
 }
 
 module.exports = {
-  fetchWithRedirectCheck
+  fetchWithRedirectCheck,
 };

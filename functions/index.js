@@ -1,222 +1,291 @@
-/**
- * Bandwidth Hero Proxy — Netlify Serverless Function
- *
- * Original proxy concept: ayastreb/bandwidth-hero-proxy (MIT)
- * Serverless port:        adi-g15/bandwidth-hero-proxy (MIT)
- * This repo:              himshim/bandwidth-hero-proxy2 (MIT)
- */
+"use strict";
 
 const shouldCompress = require("../util/shouldCompress");
-const compress       = require("../util/compress");
-const { isValidUrl, isPrivateHost } = require("../util/validate");
-const { fetchWithRedirectCheck } = require("../util/fetch");
+const compress = require("../util/compress");
+const {
+  isValidUrl,
+  isPrivateHost,
+} = require("../util/validate");
+const {
+  fetchWithRedirectCheck,
+} = require("../util/fetch");
 
 const DEFAULT_QUALITY = 40;
-
-const BH_VERSION = "2.0.0";
-const BH_API     = 1;
+const DEFAULT_TIMEOUT_MS = 8000;
+const MAX_INPUT_BYTES = 15 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+const MAX_WIDTH = 8192;
 
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers": "*",
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, OPTIONS",
+  "access-control-allow-headers": "*",
+  "access-control-expose-headers":
+    "content-type, content-length, cache-control, " +
+    "x-bh-original-size, x-bh-compressed-size, x-bh-bytes-saved",
 };
 
-// Netlify-CDN-Cache-Control: CDN-only directive, stripped before the browser sees it.
-//   durable   — share the cache entry across all edge nodes (not per-node).
-//   s-maxage  — keep compressed images at the edge for 7 days.
-//   stale-while-revalidate — serve stale while refreshing in the background.
-//
-// Cache-Control: browser directive — always revalidate, never serve stale.
-//   Prevents the browser disk cache from serving an old colour image after
-//   the user enables greyscale, or an old quality level after changing settings.
-//
-// Netlify-Vary: only vary the CDN cache key on the params that change the output.
-//   Stray params (utm_*, fbclid, etc.) are ignored — no cache fragmentation.
 const CACHE_HEADERS = {
-  "Netlify-CDN-Cache-Control": "public, durable, s-maxage=604800, stale-while-revalidate=86400",
-  "Cache-Control":             "public, max-age=0, must-revalidate",
-  "Netlify-Vary":              "query=url|quality|bw|jpeg|max_width|l",
+  "netlify-cdn-cache-control":
+    "public, durable, s-maxage=604800, stale-while-revalidate=86400",
+  "cache-control": "public, max-age=0, must-revalidate",
+  "netlify-vary": "query=url|quality|bw|jpeg|max_width|l",
 };
 
-// Protocol telemetry headers exposed on every successful image response.
-const BH_BACKEND_HEADERS = {
-  "x-bh-backend":  "bandwidth-proxy-2",
-  "x-bh-version":  BH_VERSION,
-  "x-bh-api":      String(BH_API),
+const BACKEND_HEADERS = {
+  "x-bh-backend": "bandwidth-proxy-2",
+  "x-bh-version": "2.1.0",
+  "x-bh-api": "1",
   "x-bh-features": "webp,grayscale,maxwidth,stats",
 };
 
-// Headers that must NOT be forwarded from the upstream origin:
-//   - Hop-by-hop headers (RFC 7230 §6.1) — connection-scoped, meaningless end-to-end.
-//   - Headers the proxy sets itself — forwarding them would silently override our values.
-//   - Upstream security headers — scoped to the origin's domain, not ours.
-//   - CDN-internal headers (Cloudflare cf-*, age, via) — irrelevant to the client.
 const UPSTREAM_HEADER_DENYLIST = new Set([
-  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-  "te", "trailer", "transfer-encoding", "upgrade",
-  "cache-control", "content-encoding", "content-length",
-  "set-cookie", "strict-transport-security",
-  "age", "via", "alt-svc", "server",
-  "cf-cache-status", "cf-ray",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "cache-control",
+  "content-encoding",
+  "content-length",
+  "content-range",
+  "set-cookie",
+  "strict-transport-security",
+  "age",
+  "via",
+  "alt-svc",
+  "server",
+  "location",
+  "cf-cache-status",
+  "cf-ray",
 ]);
 
-exports.handler = async (e) => {
-  if (e.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: CORS_HEADERS, body: "" };
+function response(statusCode, body, headers = {}) {
+  return {
+    statusCode,
+    headers: {
+      ...CORS_HEADERS,
+      ...headers,
+    },
+    body,
+  };
+}
+
+function numberInRange(value, fallback, min, max) {
+  const number = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(number)) {
+    return fallback;
   }
 
-  let { url: r } = e.queryStringParameters;
+  return Math.min(max, Math.max(min, number));
+}
 
-  // jpeg:      "1" = use JPEG (client has no WebP), "0" or absent = use WebP
-  // bw:        "1" = grayscale, "0" or absent = colour
-  // quality/l: compression quality 1–100.
-  //            Our extension sends "quality=", original ayastreb sends "l=".
-  //            Both accepted so this proxy works with either extension.
-  // max_width: downscale images wider than this before compressing, 0 = no limit.
-  //            Our extension sends this; original extension does not — safe to ignore.
-  const { jpeg: s, bw: o, quality: q, l, max_width: mw } = e.queryStringParameters;
+function getQuery(event) {
+  return event.queryStringParameters || {};
+}
 
-  if (!r) {
-    return { statusCode: 200, headers: CORS_HEADERS, body: "bandwidth-hero-proxy" };
+function getImageUrl(value) {
+  if (!value) {
+    return null;
   }
 
-  try { r = JSON.parse(r); } catch {}
-  Array.isArray(r) && (r = r.join("&url="));
-  r = r.replace(/http:\/\/1\.1\.\d\.\d\/bmi\/(https?:\/\/)?/i, "http://");
-
-  if (!isValidUrl(r)) {
-    return { statusCode: 400, headers: CORS_HEADERS, body: "Invalid URL" };
-  }
-  const parsedUrl = new URL(r);
-  if (isPrivateHost(parsedUrl.hostname)) {
-    return { statusCode: 403, headers: CORS_HEADERS, body: "Forbidden" };
-  }
-
-  // useWebp: true unless client explicitly sent jpeg=1.
-  const useWebp = s !== "1";
-
-  // grayscale: only true when bw is explicitly "1".
-  const grayscale = o === "1";
-
-  // Accept both param names for compatibility with original and our extension.
-  const quality  = parseInt(q || l, 10) || DEFAULT_QUALITY;
-
-  const maxWidth = parseInt(mw, 10) || 0;
+  let url = value;
 
   try {
-    let upstreamHeaders = {}, body, contentType;
+    const parsed = JSON.parse(value);
+    url = Array.isArray(parsed)
+      ? parsed.join("&url=")
+      : typeof parsed === "string"
+        ? parsed
+        : value;
+  } catch {
+    // The extension normally sends a plain URL.
+  }
 
-    try {
-      const response = await fetchWithRedirectCheck(
-        r,
-        {
-          headers: {
-            ...(e.headers.cookie   && { cookie:   e.headers.cookie }),
-            ...(e.headers.dnt      && { dnt:      e.headers.dnt }),
-            ...(e.headers.referer  && { referer:  e.headers.referer }),
-            "user-agent":
-              e.headers["user-agent"] ||
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "accept":
-              e.headers["accept"] ||
-              "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "accept-language": e.headers["accept-language"] || "en-US,en;q=0.9",
-            "accept-encoding": "identity",
-            "x-forwarded-for": e.headers["x-forwarded-for"] || e.ip,
-            via: "1.1 bandwidth-hero",
-          },
-          timeout: 8000
-        }
-      );
+  return String(url)
+    .replace(
+      /http:\/\/1\.1\.\d+\.\d+\/bmi\/(https?:\/\/)?/i,
+      "http://"
+    )
+    .trim();
+}
 
-      if (!response.ok) {
-        return { statusCode: response.status || 302, headers: CORS_HEADERS, body: "" };
-      }
+function copyUpstreamHeaders(headers) {
+  const result = {};
 
-      // Forward only safe, non-conflicting headers from the upstream response.
-      response.headers.forEach((value, key) => {
-        if (!UPSTREAM_HEADER_DENYLIST.has(key.toLowerCase())) {
-          upstreamHeaders[key] = value;
-        }
-      });
+  headers.forEach((value, key) => {
+    if (!UPSTREAM_HEADER_DENYLIST.has(key.toLowerCase())) {
+      result[key] = value;
+    }
+  });
 
-      const arrayBuffer = await response.arrayBuffer();
-      body        = Buffer.from(arrayBuffer);
-      contentType = response.headers.get("content-type") || "";
+  return result;
+}
 
-    } catch (fetchErr) {
-      if (fetchErr.message === "FETCH_TIMEOUT") {
-        return { statusCode: 504, headers: CORS_HEADERS, body: "Upstream fetch timed out" };
-      }
-      throw fetchErr;
+function requestHeaders(event) {
+  const headers = event.headers || {};
+  const get = (name) => headers[name] || headers[name.toLowerCase()];
+
+  return {
+    ...(get("cookie") && { cookie: get("cookie") }),
+    ...(get("dnt") && { dnt: get("dnt") }),
+    ...(get("referer") && { referer: get("referer") }),
+    "user-agent":
+      get("user-agent") ||
+      "Mozilla/5.0 (compatible; BandwidthHeroProxy/2.1)",
+    accept:
+      get("accept") ||
+      "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "accept-language": get("accept-language") || "en-US,en;q=0.9",
+    "accept-encoding": "identity",
+  };
+}
+
+exports.handler = async (event) => {
+  if (event.httpMethod === "OPTIONS") {
+    return response(204, "");
+  }
+
+  const query = getQuery(event);
+  const rawUrl = getImageUrl(query.url);
+
+  if (!rawUrl) {
+    return response(200, "bandwidth-hero-proxy");
+  }
+
+  if (!isValidUrl(rawUrl)) {
+    return response(400, "Invalid URL");
+  }
+
+  const parsedUrl = new URL(rawUrl);
+
+  if (isPrivateHost(parsedUrl.hostname)) {
+    return response(403, "Forbidden");
+  }
+
+  const useWebp = query.jpeg !== "1";
+  const grayscale = query.bw === "1";
+  const quality = numberInRange(
+    query.quality || query.l,
+    DEFAULT_QUALITY,
+    1,
+    100
+  );
+  const maxWidth = numberInRange(query.max_width, 0, 0, MAX_WIDTH);
+
+  try {
+    const upstream = await fetchWithRedirectCheck(
+      rawUrl,
+      {
+        headers: requestHeaders(event),
+        timeout: DEFAULT_TIMEOUT_MS,
+        maxBytes: MAX_INPUT_BYTES,
+      },
+      MAX_REDIRECTS
+    );
+
+    if (!upstream.ok) {
+      return response(upstream.status || 502, "");
     }
 
-    if (contentType && !contentType.startsWith("image/")) {
-      console.log("Non-image content-type:", contentType, "for URL:", r);
-      return {
-        statusCode: 415,
-        headers:    CORS_HEADERS,
-        body:       `Upstream returned non-image response (${contentType})`,
-      };
+    const contentType =
+      upstream.headers.get("content-type") || "application/octet-stream";
+
+    if (!contentType.toLowerCase().startsWith("image/")) {
+      return response(
+        415,
+        `Upstream returned non-image response (${contentType})`
+      );
+    }
+
+    const contentLength = Number.parseInt(
+      upstream.headers.get("content-length"),
+      10
+    );
+
+    if (contentLength > MAX_INPUT_BYTES) {
+      return response(413, "Image is too large");
+    }
+
+    const body = Buffer.from(await upstream.arrayBuffer());
+
+    if (body.length > MAX_INPUT_BYTES) {
+      return response(413, "Image is too large");
     }
 
     const originalSize = body.length;
+    const upstreamHeaders = copyUpstreamHeaders(upstream.headers);
 
-    // useWebp doubles as the isTransparent flag: WebP supports transparency so
-    // the lower 1024-byte minimum threshold applies in WebP mode, meaning almost
-    // all images get compressed. In JPEG mode the higher PNG/GIF threshold applies.
     if (!shouldCompress(contentType, originalSize, useWebp)) {
-      console.log("Bypassing compression. Size:", originalSize);
       return {
-        statusCode:      200,
-        body:            body.toString("base64"),
+        statusCode: 200,
         isBase64Encoded: true,
+        body: body.toString("base64"),
         headers: {
           ...CORS_HEADERS,
           ...CACHE_HEADERS,
-          "content-encoding":     "identity",
           ...upstreamHeaders,
-          ...BH_BACKEND_HEADERS,
-          "x-bh-original-size":   String(originalSize),
+          "content-type": contentType,
+          "content-encoding": "identity",
+          ...BACKEND_HEADERS,
+          "x-bh-original-size": String(originalSize),
           "x-bh-compressed-size": String(originalSize),
-          "x-bh-bytes-saved":     "0",
+          "x-bh-bytes-saved": "0",
         },
       };
     }
 
-    const { err, output, headers: compressedHeaders } = await compress(
-      body, useWebp, grayscale, quality, originalSize, maxWidth
+    const result = await compress(
+      body,
+      useWebp,
+      grayscale,
+      quality,
+      originalSize,
+      maxWidth
     );
 
-    if (err) {
-      console.log("Compression failed:", r);
-      throw err;
+    if (result.err) {
+      throw result.err;
     }
 
-    console.log(
-      `From ${originalSize}, saved: ${((originalSize - output.length) / originalSize * 100).toFixed(1)}%`
-    );
-
     return {
-      statusCode:      200,
-      body:            output.toString("base64"),
+      statusCode: 200,
       isBase64Encoded: true,
+      body: result.output.toString("base64"),
       headers: {
         ...CORS_HEADERS,
         ...CACHE_HEADERS,
-        "content-encoding":     "identity",
         ...upstreamHeaders,
-        ...compressedHeaders,
-        ...BH_BACKEND_HEADERS,
-        "x-bh-original-size":   String(originalSize),
-        "x-bh-compressed-size": String(output.length),
-        "x-bh-bytes-saved":     String(originalSize - output.length),
+        ...result.headers,
+        "content-encoding": "identity",
+        ...BACKEND_HEADERS,
       },
     };
+  } catch (error) {
+    if (error.message === "FETCH_TIMEOUT") {
+      return response(504, "Upstream fetch timed out");
+    }
 
-  } catch (err) {
-    console.error(err);
-    return { statusCode: 500, headers: CORS_HEADERS, body: err.message || "" };
+    if (error.message === "MAX_RESPONSE_SIZE_EXCEEDED") {
+      return response(413, "Image is too large");
+    }
+
+    if (
+      error.message === "FORBIDDEN_PRIVATE_REDIRECT" ||
+      error.message === "INVALID_REDIRECT_URL"
+    ) {
+      return response(403, "Forbidden");
+    }
+
+    if (error.message === "MAX_REDIRECTS_EXCEEDED") {
+      return response(508, "Too many redirects");
+    }
+
+    console.error("Proxy error:", error);
+    return response(502, "Unable to fetch or process image");
   }
 };

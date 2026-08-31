@@ -381,8 +381,8 @@
                 
                 if (response.status === 200) {
                     const contentType = response.headers.get("content-type");
-                    const origSize = response.headers.get("x-original-size");
-                    const bytesSaved = response.headers.get("x-bytes-saved");
+                    const origSize = response.headers.get("x-bh-original-size");
+                    const bytesSaved = response.headers.get("x-bh-bytes-saved");
                     const cacheControl = response.headers.get("cache-control");
 
                     if (contentType && contentType.includes("image/")) {
