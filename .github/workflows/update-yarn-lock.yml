@@ -1,0 +1,55 @@
+name: Update yarn.lock
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-lockfile:
+    runs-on: ubuntu-latest
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true
+      
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Update dependencies and yarn.lock
+        run: yarn upgrade --ignore-scripts
+
+      - name: Run tests
+        run: yarn test
+        continue-on-error: true
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update yarn.lock"
+          branch: automation/update-yarn-lock
+          delete-branch: true
+          title: "chore: update yarn.lock"
+          body: |
+            Automatically updated dependencies and yarn.lock.
+
+            Please review the dependency changes and CI results before merging.
+          add-paths: |
+            yarn.lock
