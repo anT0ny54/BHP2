@@ -2,65 +2,70 @@
 
 const sharp = require("sharp");
 
-function compress(
+async function compress(
   input,
   useWebp,
   grayscale,
   quality,
   originalSize,
-  maxWidth
+  maxWidth = 0
 ) {
-  const format = useWebp ? "webp" : "jpeg";
-  let pipeline = sharp(input, {
-    failOn: "none",
-    limitInputPixels: 268402689,
-  });
+  try {
+    const format = useWebp ? "webp" : "jpeg";
 
-  if (maxWidth > 0) {
-    pipeline = pipeline.resize({
-      width: maxWidth,
-      fit: "inside",
-      withoutEnlargement: true,
-      fastShrinkOnLoad: true,
-    });
-  }
+    let pipeline = sharp(input, {
+      animated: false,
+      failOn: "none",
+    }).rotate();
 
-  if (grayscale) {
-    pipeline = pipeline.grayscale();
-  }
+    if (maxWidth > 0) {
+      pipeline = pipeline.resize({
+        width: maxWidth,
+        fit: "inside",
+        withoutEnlargement: true,
+        fastShrinkOnLoad: true,
+      });
+    }
 
-  const formatOptions = useWebp
-    ? {
+    if (grayscale) {
+      pipeline = pipeline.grayscale();
+    }
+
+    if (useWebp) {
+      pipeline = pipeline.webp({
         quality,
-        effort: 3,
+        effort: 4,
         smartSubsample: true,
-      }
-    : {
+      });
+    } else {
+      pipeline = pipeline.jpeg({
         quality,
         progressive: true,
         mozjpeg: true,
         chromaSubsampling: "4:2:0",
-      };
+      });
+    }
 
-  return pipeline
-    .toFormat(format, formatOptions)
-    .toBuffer()
-    .then((output) => ({
+    const output = await pipeline.toBuffer();
+
+    return {
       err: null,
       output,
       headers: {
         "content-type": `image/${format}`,
         "content-length": String(output.length),
-        "x-bh-original-size": String(originalSize),
-        "x-bh-compressed-size": String(output.length),
-        "x-bh-bytes-saved": String(originalSize - output.length),
+        "x-original-size": String(originalSize),
+        "x-compressed-size": String(output.length),
+        "x-bytes-saved": String(originalSize - output.length),
       },
-    }))
-    .catch((err) => ({
+    };
+  } catch (err) {
+    return {
       err,
       output: null,
       headers: {},
-    }));
+    };
+  }
 }
 
 module.exports = compress;
