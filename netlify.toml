@@ -8,6 +8,7 @@
 
 [functions]
   node_bundler = "esbuild"
+  # Critical: ensure sharp's native binaries are included in the lambda package
   included_files = ["node_modules/sharp/**/*"]
 
 [[redirects]]
@@ -18,7 +19,6 @@
 
 [[headers]]
   for = "/api/*"
-
   [headers.values]
     Access-Control-Allow-Origin = "*"
     Access-Control-Allow-Methods = "GET, OPTIONS"
@@ -28,7 +28,6 @@
 
 [[headers]]
   for = "/*"
-
   [headers.values]
     X-Frame-Options = "DENY"
     X-Content-Type-Options = "nosniff"
