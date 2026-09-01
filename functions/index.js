@@ -1,14 +1,18 @@
-"use strict";
+import sharp from "sharp";
 
-const sharp = require("sharp");
+import {
+  PRIVATE_HOST_ERROR,
+  resolveAndValidateRemoteUrl,
+  validateRemoteUrl,
+} from "../util/validate.js";
 
 const DEFAULT_QUALITY = 40;
 const DEFAULT_MAX_WIDTH = 0;
-
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_REDIRECTS = 5;
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_INPUT_PIXELS = 40_000_000;
+const PROXY_VERSION = "2.0.1";
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
@@ -16,14 +20,18 @@ const CORS_HEADERS = {
   "access-control-allow-headers": "*",
 };
 
-const CACHE_HEADERS = {
+const PUBLIC_CACHE_HEADERS = {
   "cache-control":
     "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400",
 };
 
+const PRIVATE_CACHE_HEADERS = {
+  "cache-control": "private, no-store",
+};
+
 const BASE_HEADERS = {
   ...CORS_HEADERS,
-  ...CACHE_HEADERS,
+  ...PUBLIC_CACHE_HEADERS,
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
 };
@@ -53,13 +61,18 @@ function createResponse(statusCode, body = "", headers = {}) {
   };
 }
 
-function createBinaryResponse(buffer, headers = {}) {
+function createBinaryResponse(
+  buffer,
+  headers = {},
+  cacheHeaders = PUBLIC_CACHE_HEADERS
+) {
   return {
     statusCode: 200,
     isBase64Encoded: true,
     body: buffer.toString("base64"),
     headers: {
       ...BASE_HEADERS,
+      ...cacheHeaders,
       ...headers,
     },
   };
@@ -78,7 +91,6 @@ function getImageUrl(value) {
     return value.join("&url=");
   }
 
-  // Compatibility with clients that send the URL as a JSON string or array.
   try {
     const parsed = JSON.parse(value);
 
@@ -90,7 +102,7 @@ function getImageUrl(value) {
       return parsed;
     }
   } catch {
-    // The value is a normal URL.
+    // Treat value as a normal URL.
   }
 
   return value;
@@ -99,112 +111,12 @@ function getImageUrl(value) {
 function normalizeImageUrl(value) {
   let imageUrl = getImageUrl(value).trim();
 
-  // Support the old Bandwidth Hero format:
-  // http://1.1.1.1/bmi/https://example.com/image.jpg
   imageUrl = imageUrl.replace(
     /^http:\/\/1\.1\.\d+\.\d+\/bmi\/(https?:\/\/)?/i,
     "http://"
   );
 
   return imageUrl;
-}
-
-function parseHttpUrl(value) {
-  try {
-    const parsedUrl = new URL(value);
-
-    if (
-      parsedUrl.protocol !== "http:" &&
-      parsedUrl.protocol !== "https:"
-    ) {
-      return null;
-    }
-
-    return parsedUrl;
-  } catch {
-    return null;
-  }
-}
-
-function isPrivateHostname(hostname) {
-  const host = hostname
-    .toLowerCase()
-    .replace(/^\[|\]$/g, "");
-
-  const privateHostnames = new Set([
-    "localhost",
-    "localhost.localdomain",
-    "local",
-    "ip6-localhost",
-    "ip6-loopback",
-    "::1",
-    "0.0.0.0",
-  ]);
-
-  if (privateHostnames.has(host)) {
-    return true;
-  }
-
-  // IPv4 validation and private ranges.
-  const ipv4Match = host.match(
-    /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
-  );
-
-  if (ipv4Match) {
-    const octets = ipv4Match.slice(1).map(Number);
-
-    if (octets.some((part) => part < 0 || part > 255)) {
-      return true;
-    }
-
-    const [a, b] = octets;
-
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 198 && (b === 18 || b === 19)) ||
-      a >= 224
-    );
-  }
-
-  // IPv6 private, loopback, link-local and unspecified ranges.
-  return (
-    host === "::" ||
-    host.startsWith("fc") ||
-    host.startsWith("fd") ||
-    host.startsWith("fe8") ||
-    host.startsWith("fe9") ||
-    host.startsWith("fea") ||
-    host.startsWith("feb")
-  );
-}
-
-function validateRemoteUrl(value) {
-  const parsedUrl = parseHttpUrl(value);
-
-  if (!parsedUrl) {
-    return {
-      valid: false,
-      error: "Invalid URL. Only HTTP and HTTPS URLs are supported.",
-    };
-  }
-
-  if (isPrivateHostname(parsedUrl.hostname)) {
-    return {
-      valid: false,
-      error: "Requests to private or local addresses are not allowed.",
-    };
-  }
-
-  return {
-    valid: true,
-    url: parsedUrl.toString(),
-  };
 }
 
 function parseInteger(value, fallback, min, max) {
@@ -219,6 +131,11 @@ function parseInteger(value, fallback, min, max) {
 
 function parseBoolean(value) {
   return value === "1" || value === "true";
+}
+
+function hasForwardedCredentials(event) {
+  const headers = event.headers || {};
+  return Boolean(headers.cookie);
 }
 
 function getForwardedHeaders(event) {
@@ -250,7 +167,6 @@ function getForwardedHeaders(event) {
     input.accept ||
     "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
 
-  // Sharp should receive the decoded image body.
   headers["accept-encoding"] = "identity";
 
   return headers;
@@ -338,11 +254,12 @@ async function fetchImage(event, initialUrl) {
     redirect <= MAX_REDIRECTS;
     redirect += 1
   ) {
-    const validation = validateRemoteUrl(currentUrl);
+    const validation =
+      await resolveAndValidateRemoteUrl(currentUrl);
 
     if (!validation.valid) {
       const error = new Error(validation.error);
-      error.statusCode = 403;
+      error.statusCode = validation.statusCode || 403;
       throw error;
     }
 
@@ -495,29 +412,42 @@ function getOutputHeaders({
     "content-type": contentType,
     "content-length": String(compressedSize),
     "content-encoding": "identity",
+
+    // Current protocol headers.
+    "x-bh-backend": "bandwidth-proxy-2",
+    "x-bh-version": PROXY_VERSION,
+    "x-bh-api": "1",
+    "x-bh-features": "webp,grayscale,maxwidth,stats",
+    "x-bh-original-size": String(originalSize),
+    "x-bh-compressed-size": String(compressedSize),
+    "x-bh-bytes-saved": String(bytesSaved),
+
+    // Legacy headers retained for compatibility.
     "x-original-size": String(originalSize),
     "x-compressed-size": String(compressedSize),
     "x-bytes-saved": String(bytesSaved),
   };
 }
 
-exports.handler = async (event) => {
+export async function handler(event = {}) {
   const method = event.httpMethod || "GET";
 
   if (method === "OPTIONS") {
-    return createResponse(204);
+    return createResponse(204, "", {
+      ...PRIVATE_CACHE_HEADERS,
+    });
   }
 
   if (method !== "GET") {
     return createResponse(405, "Method Not Allowed", {
       allow: "GET, OPTIONS",
       "content-type": "text/plain; charset=utf-8",
+      ...PRIVATE_CACHE_HEADERS,
     });
   }
 
   const query = getQueryParameters(event);
 
-  // Used by Bandwidth Hero-compatible extensions to test availability.
   if (!query.url) {
     return createResponse(200, "bandwidth-hero-proxy", {
       "content-type": "text/plain; charset=utf-8",
@@ -526,21 +456,18 @@ exports.handler = async (event) => {
   }
 
   const imageUrl = normalizeImageUrl(query.url);
-  const validation = validateRemoteUrl(imageUrl);
+  const initialValidation = validateRemoteUrl(imageUrl);
 
-  if (!validation.valid) {
-    return createResponse(400, validation.error, {
+  if (!initialValidation.valid) {
+    return createResponse(400, initialValidation.error, {
       "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store",
+      ...PRIVATE_CACHE_HEADERS,
     });
   }
 
   const useWebp = query.jpeg !== "1";
   const grayscale = parseBoolean(query.bw);
 
-  // Supports both:
-  // quality=40
-  // l=40
   const quality = parseInteger(
     query.quality ?? query.l,
     DEFAULT_QUALITY,
@@ -555,8 +482,19 @@ exports.handler = async (event) => {
     8192
   );
 
+  const requestHasCredentials =
+    hasForwardedCredentials(event);
+
+  const cacheHeaders = requestHasCredentials
+    ? PRIVATE_CACHE_HEADERS
+    : PUBLIC_CACHE_HEADERS;
+
   try {
-    const source = await fetchImage(event, validation.url);
+    const source = await fetchImage(
+      event,
+      initialValidation.url
+    );
+
     const originalSize = source.buffer.length;
 
     const compressed = await compressImage(
@@ -567,32 +505,39 @@ exports.handler = async (event) => {
       maxWidth
     );
 
-    const outputIsSmaller = compressed.length < originalSize;
+    const outputIsSmaller =
+      compressed.length < originalSize;
 
-    // Returning the source image prevents the proxy from increasing
-    // bandwidth usage for already-compressed images.
     if (!outputIsSmaller) {
-      return createBinaryResponse(source.buffer, {
-        ...getSafeUpstreamHeaders(source.headers),
-        ...getOutputHeaders({
-          contentType: source.contentType,
-          originalSize,
-          compressedSize: originalSize,
-        }),
-      });
+      return createBinaryResponse(
+        source.buffer,
+        {
+          ...getSafeUpstreamHeaders(source.headers),
+          ...getOutputHeaders({
+            contentType: source.contentType,
+            originalSize,
+            compressedSize: originalSize,
+          }),
+        },
+        cacheHeaders
+      );
     }
 
     const outputType = useWebp
       ? "image/webp"
       : "image/jpeg";
 
-    return createBinaryResponse(compressed, {
-      ...getOutputHeaders({
-        contentType: outputType,
-        originalSize,
-        compressedSize: compressed.length,
-      }),
-    });
+    return createBinaryResponse(
+      compressed,
+      {
+        ...getOutputHeaders({
+          contentType: outputType,
+          originalSize,
+          compressedSize: compressed.length,
+        }),
+      },
+      cacheHeaders
+    );
   } catch (error) {
     console.error("Image proxy error:", error);
 
@@ -602,8 +547,8 @@ exports.handler = async (event) => {
       error.statusCode <= 599
         ? error.statusCode
         : error.name === "AbortError"
-        ? 504
-        : 500;
+          ? 504
+          : 500;
 
     const message =
       error.name === "AbortError"
@@ -612,7 +557,7 @@ exports.handler = async (event) => {
 
     return createResponse(statusCode, message, {
       "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store",
+      ...PRIVATE_CACHE_HEADERS,
     });
   }
-};
+}

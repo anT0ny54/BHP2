@@ -1,18 +1,30 @@
-"use strict";
-
-exports.handler = async (event) => ({
-  statusCode: event.httpMethod === "OPTIONS" ? 204 : 200,
-  headers: {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, OPTIONS",
-    "access-control-allow-headers": "*",
-    "content-type": "application/json",
-    "cache-control": "no-store",
-  },
-  body: event.httpMethod === "OPTIONS"
-    ? ""
-    : JSON.stringify({
-        status: "ok",
-        service: "bandwidth-hero-proxy",
+export async function handler(event = {}) {
+  if (event.httpMethod && event.httpMethod !== "GET") {
+    return {
+      statusCode: 405,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        allow: "GET",
+      },
+      body: JSON.stringify({
+        error: "Method Not Allowed",
       }),
-});
+    };
+  }
+
+  return {
+    statusCode: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+      "x-content-type-options": "nosniff",
+    },
+    body: JSON.stringify({
+      status: "ok",
+      service: "bandwidth-hero-proxy",
+      version: "2.0.1",
+    }),
+  };
+}
