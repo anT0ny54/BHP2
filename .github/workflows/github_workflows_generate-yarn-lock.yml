@@ -7,7 +7,7 @@ on:
     paths:
       - package.json
       - yarn.lock
-      - .github/workflows/yarn.yml
+      - .github/workflows/github_workflows_generate-yarn-lock.yml
 
   workflow_dispatch:
 
@@ -35,31 +35,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18.18.0"
+          node-version: "20.19.0"
 
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Install dependencies
-        run: yarn install
-
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Commit updated yarn.lock
-        run: |
-          git add yarn.lock
-
-          if git diff --cached --quiet; then
-            echo "No changes detected in yarn.lock."
-            exit 0
-          fi
-
-          git commit -m "chore: update yarn.lock"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-          
       - name: Enable Corepack
         run: corepack enable
 
