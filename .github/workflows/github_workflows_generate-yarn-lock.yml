@@ -1,0 +1,62 @@
+name: Generate yarn.lock
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - package.json
+      - yarn.lock
+      - .github/workflows/github_workflows_generate-yarn-lock.yml
+
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 2 * * 0" # Weekly, Sunday at 02:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: generate-yarn-lock-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-lockfile:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.0"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit updated yarn.lock
+        run: |
+          git add yarn.lock
+
+          if git diff --cached --quiet; then
+            echo "No changes detected in yarn.lock."
+            exit 0
+          fi
+
+          git commit -m "chore: update yarn.lock"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          
