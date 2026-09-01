@@ -1,326 +1,504 @@
-const { handler } = require("../functions/index");
-const { test, expect, beforeAll, afterEach } = require("@jest/globals");
+import assert from "node:assert/strict";
+import { after, before, test } from "node:test";
 
-jest.mock("sharp", () => {
-  return jest.fn().mockImplementation(() => {
-    return {
-      resize:   jest.fn().mockReturnThis(),
-      grayscale: jest.fn().mockReturnThis(),
-      toFormat: jest.fn().mockReturnThis(),
-      toBuffer: jest.fn().mockResolvedValue({
-        data: Buffer.from("fake-compressed-webp-data"),
-        info: { size: 100 }
-      })
-    };
-  });
-});
+import sharp from "sharp";
+
+import {
+  handler,
+} from "../functions/index.js";
+
+import {
+  isPrivateHost,
+  isPrivateIp,
+  resetDnsLookupForTests,
+  setDnsLookupForTests,
+  validateRemoteUrl,
+  resolveAndValidateRemoteUrl,
+} from "../util/validate.js";
 
 let originalFetch;
+let testImage;
 
-beforeAll(() => {
+before(async () => {
   originalFetch = global.fetch;
+
+  testImage = await sharp({
+    create: {
+      width: 64,
+      height: 64,
+      channels: 3,
+      background: {
+        r: 255,
+        g: 0,
+        b: 0,
+      },
+    },
+  })
+    .png()
+    .toBuffer();
 });
 
-afterEach(() => {
+after(() => {
   global.fetch = originalFetch;
-  jest.restoreAllMocks();
+  resetDnsLookupForTests();
 });
 
-test("Compatibility: returns correct response when no url query parameter is provided", async () => {
-  const event = {
-    headers: {},
-    queryStringParameters: {},
-  };
-
-  const response = await handler(event);
-
-  expect(response.statusCode).toBe(200);
-  expect(response.body).toBe("bandwidth-hero-proxy");
-});
-
-test("Security: blocks invalid URLs with 400", async () => {
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "not-a-valid-url"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(400);
-  expect(response.body).toBe("Invalid URL");
-});
-
-test("Security: blocks private hosts with 403", async () => {
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "http://localhost/test.jpg"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(403);
-  expect(response.body).toBe("Forbidden");
-});
-
-test("Security: blocks redirects to private hosts with 500 (SSRF defense)", async () => {
-  // Mock fetch to simulate a redirect to localhost
-  global.fetch = jest.fn().mockImplementation((url, options) => {
-    if (url === "https://legit-cdn.com/image.jpg") {
-      return Promise.resolve({
-        status: 302,
-        headers: {
-          get: (name) => (name.toLowerCase() === "location" ? "http://127.0.0.1:8080/admin" : null)
-        }
-      });
-    }
-    return Promise.reject(new Error("Unexpected fetch call"));
-  });
-
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "https://legit-cdn.com/image.jpg"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(500);
-  expect(response.body).toBe("FORBIDDEN_PRIVATE_REDIRECT");
-});
-
-test("Security: enforces redirect limit with 500", async () => {
-  // Mock fetch to create a loop
-  global.fetch = jest.fn().mockImplementation((url) => {
-    return Promise.resolve({
-      status: 302,
-      headers: {
-        get: (name) => (name.toLowerCase() === "location" ? url : null)
-      }
-    });
-  });
-
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "https://legit-cdn.com/image.jpg"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(500);
-  expect(response.body).toBe("MAX_REDIRECTS_EXCEEDED");
-});
-
-test("Security: handles relative redirects correctly", async () => {
-  global.fetch = jest.fn().mockImplementation((url) => {
-    if (url === "https://legit-cdn.com/relative-redirect") {
-      return Promise.resolve({
-        status: 302,
-        headers: {
-          get: (name) => (name.toLowerCase() === "location" ? "/target.jpg" : null)
-        }
-      });
-    }
-    if (url === "https://legit-cdn.com/target.jpg") {
-      return Promise.resolve({
-        status: 200,
-        ok: true,
-        headers: {
-          get: (name) => (name.toLowerCase() === "content-type" ? "image/jpeg" : null),
-          forEach: () => {}
-        },
-        arrayBuffer: () => Promise.resolve(Buffer.alloc(2000))
-      });
-    }
-    return Promise.reject(new Error("Unexpected fetch call"));
-  });
-
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "https://legit-cdn.com/relative-redirect"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(200);
-});
-
-test("Security: handles chained redirects up to limits", async () => {
-  global.fetch = jest.fn().mockImplementation((url) => {
-    if (url === "https://legit-cdn.com/hop1") {
-      return Promise.resolve({
-        status: 302,
-        headers: {
-          get: (name) => (name.toLowerCase() === "location" ? "https://legit-cdn.com/hop2" : null)
-        }
-      });
-    }
-    if (url === "https://legit-cdn.com/hop2") {
-      return Promise.resolve({
-        status: 302,
-        headers: {
-          get: (name) => (name.toLowerCase() === "location" ? "https://legit-cdn.com/target.jpg" : null)
-        }
-      });
-    }
-    if (url === "https://legit-cdn.com/target.jpg") {
-      return Promise.resolve({
-        status: 200,
-        ok: true,
-        headers: {
-          get: (name) => (name.toLowerCase() === "content-type" ? "image/jpeg" : null),
-          forEach: () => {}
-        },
-        arrayBuffer: () => Promise.resolve(Buffer.alloc(2000))
-      });
-    }
-    return Promise.reject(new Error("Unexpected fetch call"));
-  });
-
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "https://legit-cdn.com/hop1"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(200);
-});
-
-test("Image Pipeline: successfully processes and compresses a valid image response", async () => {
-  // Make dummy buffer larger than 1024 bytes to bypass MIN_COMPRESS_LENGTH check
-  const jpegBuffer = Buffer.alloc(2000);
-
-  global.fetch = jest.fn().mockImplementation((url) => {
-    if (url === "https://legit-cdn.com/image.jpg") {
-      const headersMap = {
-        "content-type": "image/jpeg",
-        "content-length": jpegBuffer.length.toString()
-      };
-      return Promise.resolve({
-        status: 200,
-        ok: true,
-        headers: {
-          get: (name) => headersMap[name.toLowerCase()] || null,
-          forEach: (cb) => {
-            Object.entries(headersMap).forEach(([k, v]) => cb(v, k));
-          }
-        },
-        arrayBuffer: () => Promise.resolve(jpegBuffer.buffer.slice(jpegBuffer.byteOffset, jpegBuffer.byteOffset + jpegBuffer.byteLength))
-      });
-    }
-    return Promise.reject(new Error("Unexpected fetch call"));
-  });
-
-  const event = {
-    headers: {},
-    queryStringParameters: {
-      url: "https://legit-cdn.com/image.jpg",
-      quality: "50"
-    },
-  };
-
-  const response = await handler(event);
-  expect(response.statusCode).toBe(200);
-  expect(response.isBase64Encoded).toBe(true);
-  
-  // Output should be webp by default
-  expect(response.headers["content-type"]).toBe("image/webp");
-  
-  // Clean base64 payload should be parseable
-  const outputBuffer = Buffer.from(response.body, "base64");
-  expect(outputBuffer.toString()).toBe("fake-compressed-webp-data");
-});
-
-// ─── Protocol Header Tests ────────────────────────────────────────────────────
-
-function makeMockEvent(extra = {}) {
-  const jpegBuffer = Buffer.alloc(2000);
-  const headersMap = {
-    "content-type":   "image/jpeg",
-    "content-length": jpegBuffer.length.toString(),
-  };
-
-  global.fetch = jest.fn().mockResolvedValue({
+function mockImageResponse(buffer = testImage) {
+  return new Response(buffer, {
     status: 200,
-    ok: true,
     headers: {
-      get:     (name) => headersMap[name.toLowerCase()] || null,
-      forEach: (cb)   => Object.entries(headersMap).forEach(([k, v]) => cb(v, k)),
+      "content-type": "image/png",
+      "content-length": String(buffer.length),
+      etag: '"test-image"',
     },
-    arrayBuffer: () =>
-      Promise.resolve(
-        jpegBuffer.buffer.slice(jpegBuffer.byteOffset, jpegBuffer.byteOffset + jpegBuffer.byteLength)
-      ),
   });
+}
 
-  return {
-    headers: {},
-    queryStringParameters: {
-      url:     "https://legit-cdn.com/image.jpg",
-      quality: "50",
-      ...extra,
+function mockRedirectResponse(location) {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location,
     },
+  });
+}
+
+function makeEvent(query = {}, headers = {}) {
+  return {
+    httpMethod: "GET",
+    headers,
+    queryStringParameters: query,
   };
 }
 
-test("Protocol: x-bh-backend header identifies proxy on compressed response", async () => {
-  const response = await handler(makeMockEvent());
-  expect(response.headers["x-bh-backend"]).toBe("bandwidth-proxy-2");
+function usePublicDnsForTests() {
+  setDnsLookupForTests(async () => [
+    {
+      address: "93.184.216.34",
+      family: 4,
+    },
+  ]);
+}
+
+test("returns the compatibility handshake without a URL", async () => {
+  const response = await handler(
+    makeEvent()
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body, "bandwidth-hero-proxy");
+  assert.equal(
+    response.headers["content-type"],
+    "text/plain; charset=utf-8"
+  );
 });
 
-test("Protocol: x-bh-version matches semantic version on compressed response", async () => {
-  const response = await handler(makeMockEvent());
-  expect(response.headers["x-bh-version"]).toMatch(/^\d+\.\d+\.\d+$/);
+test("rejects malformed URLs with status 400", async () => {
+  const response = await handler(
+    makeEvent({
+      url: "not-a-valid-url",
+    })
+  );
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(
+    response.body,
+    "Invalid URL. Only HTTP and HTTPS URLs are supported."
+  );
+  assert.equal(
+    response.headers["cache-control"],
+    "private, no-store"
+  );
 });
 
-test("Protocol: x-bh-api reports integer API version as string on compressed response", async () => {
-  const response = await handler(makeMockEvent());
-  expect(response.headers["x-bh-api"]).toBe("1");
+test("rejects unsupported URL protocols", async () => {
+  const response = await handler(
+    makeEvent({
+      url: "file:///etc/passwd",
+    })
+  );
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(
+    response.body,
+    "Invalid URL. Only HTTP and HTTPS URLs are supported."
+  );
 });
 
-test("Protocol: x-bh-features is a comma-separated feature list on compressed response", async () => {
-  const response = await handler(makeMockEvent());
-  const features = response.headers["x-bh-features"].split(",");
-  expect(features).toEqual(expect.arrayContaining(["webp", "grayscale", "maxwidth", "stats"]));
+test("rejects localhost", async () => {
+  const response = await handler(
+    makeEvent({
+      url: "http://localhost/test.jpg",
+    })
+  );
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(
+    response.body,
+    "Requests to private or local addresses are not allowed."
+  );
 });
 
-test("Protocol: x-bh-original-size, x-bh-compressed-size, x-bh-bytes-saved present on compressed response", async () => {
-  const response = await handler(makeMockEvent());
-  expect(response.headers["x-bh-original-size"]).toBeDefined();
-  expect(response.headers["x-bh-compressed-size"]).toBeDefined();
-  expect(response.headers["x-bh-bytes-saved"]).toBeDefined();
-  // values should be numeric strings
-  expect(Number(response.headers["x-bh-original-size"])).toBeGreaterThan(0);
-  expect(Number(response.headers["x-bh-compressed-size"])).toBeGreaterThan(0);
+test("rejects private IPv4 addresses", () => {
+  assert.equal(isPrivateIp("127.0.0.1"), true);
+  assert.equal(isPrivateIp("10.0.0.1"), true);
+  assert.equal(isPrivateIp("172.16.0.1"), true);
+  assert.equal(isPrivateIp("192.168.1.1"), true);
+  assert.equal(isPrivateIp("169.254.1.1"), true);
+  assert.equal(isPrivateIp("8.8.8.8"), false);
 });
 
-test("Protocol: legacy x-original-size and x-bytes-saved headers still present (backward compat)", async () => {
-  const response = await handler(makeMockEvent());
-  expect(response.headers["x-original-size"]).toBeDefined();
-  expect(response.headers["x-bytes-saved"]).toBeDefined();
+test("rejects private IPv6 addresses", () => {
+  assert.equal(isPrivateIp("::1"), true);
+  assert.equal(isPrivateIp("::"), true);
+  assert.equal(isPrivateIp("fc00::1"), true);
+  assert.equal(isPrivateIp("fd12:3456::1"), true);
+  assert.equal(isPrivateIp("fe80::1"), true);
+  assert.equal(isPrivateIp("2001:4860:4860::8888"), false);
 });
 
-test("Protocol: grayscale param bw=1 accepted without error", async () => {
-  const response = await handler(makeMockEvent({ bw: "1" }));
-  expect(response.statusCode).toBe(200);
+test("rejects IPv4-mapped IPv6 private addresses", () => {
+  assert.equal(isPrivateIp("::ffff:127.0.0.1"), true);
+  assert.equal(isPrivateIp("::ffff:192.168.1.1"), true);
+  assert.equal(isPrivateIp("::ffff:8.8.8.8"), false);
 });
 
-test("Protocol: jpeg param jpeg=1 accepted without error", async () => {
-  const response = await handler(makeMockEvent({ jpeg: "1" }));
-  expect(response.statusCode).toBe(200);
+test("rejects private hostnames and accepts public hostnames", () => {
+  assert.equal(isPrivateHost("localhost"), true);
+  assert.equal(isPrivateHost("127.0.0.1"), true);
+  assert.equal(isPrivateHost("[::1]"), true);
+  assert.equal(isPrivateHost("example.com"), false);
 });
 
-test("Protocol: legacy quality param l= accepted alongside quality=", async () => {
-  const response = await handler(makeMockEvent({ l: "70" }));
-  expect(response.statusCode).toBe(200);
+test("validates HTTP and HTTPS URLs", () => {
+  assert.equal(
+    validateRemoteUrl("https://example.com/image.jpg").valid,
+    true
+  );
+
+  assert.equal(
+    validateRemoteUrl("ftp://example.com/image.jpg").valid,
+    false
+  );
 });
 
-test("Protocol: max_width param accepted without error", async () => {
-  const response = await handler(makeMockEvent({ max_width: "800" }));
-  expect(response.statusCode).toBe(200);
+test("blocks DNS resolution to private addresses", async () => {
+  setDnsLookupForTests(async () => [
+    {
+      address: "127.0.0.1",
+      family: 4,
+    },
+  ]);
+
+  const result = await resolveAndValidateRemoteUrl(
+    "https://attacker-controlled.example/image.jpg"
+  );
+
+  assert.equal(result.valid, false);
+  assert.equal(
+    result.error,
+    "Requests to private or local addresses are not allowed."
+  );
+});
+
+test("blocks DNS rebinding when any returned address is private", async () => {
+  setDnsLookupForTests(async () => [
+    {
+      address: "93.184.216.34",
+      family: 4,
+    },
+    {
+      address: "10.0.0.10",
+      family: 4,
+    },
+  ]);
+
+  const result = await resolveAndValidateRemoteUrl(
+    "https://rebind.example/image.jpg"
+  );
+
+  assert.equal(result.valid, false);
+  assert.equal(
+    result.error,
+    "Requests to private or local addresses are not allowed."
+  );
+});
+
+test("allows a hostname resolving only to public addresses", async () => {
+  usePublicDnsForTests();
+
+  const result = await resolveAndValidateRemoteUrl(
+    "https://cdn.example/image.jpg"
+  );
+
+  assert.equal(result.valid, true);
+  assert.equal(
+    result.url,
+    "https://cdn.example/image.jpg"
+  );
+});
+
+test("follows relative redirects", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async (url) => {
+    if (url === "https://cdn.example/start.jpg") {
+      return mockRedirectResponse("/image.jpg");
+    }
+
+    if (url === "https://cdn.example/image.jpg") {
+      return mockImageResponse();
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/start.jpg",
+    })
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.isBase64Encoded, true);
+  assert.equal(
+    response.headers["content-type"],
+    "image/webp"
+  );
+});
+
+test("blocks redirects to private addresses", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async (url) => {
+    if (url === "https://cdn.example/start.jpg") {
+      return mockRedirectResponse(
+        "http://127.0.0.1:8080/admin"
+      );
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/start.jpg",
+    })
+  );
+
+  assert.equal(response.statusCode, 403);
+  assert.equal(
+    response.body,
+    "Requests to private or local addresses are not allowed."
+  );
+});
+
+test("enforces the redirect limit", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async (url) =>
+    mockRedirectResponse(url);
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/loop.jpg",
+    })
+  );
+
+  assert.equal(response.statusCode, 508);
+  assert.equal(
+    response.body,
+    "Too many upstream redirects."
+  );
+});
+
+test("compresses an image and returns protocol headers", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async () =>
+    mockImageResponse();
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/image.png",
+      quality: "40",
+    })
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.isBase64Encoded, true);
+  assert.equal(
+    response.headers["content-type"],
+    "image/webp"
+  );
+
+  assert.match(
+    response.headers["x-bh-version"],
+    /^\d+\.\d+\.\d+$/
+  );
+
+  assert.equal(
+    response.headers["x-bh-backend"],
+    "bandwidth-proxy-2"
+  );
+
+  assert.equal(
+    response.headers["x-bh-api"],
+    "1"
+  );
+
+  assert.equal(
+    response.headers["x-bh-features"],
+    "webp,grayscale,maxwidth,stats"
+  );
+
+  assert.ok(
+    Number(response.headers["x-bh-original-size"]) > 0
+  );
+
+  assert.ok(
+    Number(response.headers["x-bh-compressed-size"]) > 0
+  );
+
+  assert.ok(
+    Number(response.headers["x-bh-bytes-saved"]) >= 0
+  );
+
+  assert.equal(
+    response.headers["x-original-size"],
+    response.headers["x-bh-original-size"]
+  );
+
+  assert.equal(
+    response.headers["x-bytes-saved"],
+    response.headers["x-bh-bytes-saved"]
+  );
+});
+
+test("does not publicly cache requests containing cookies", async () => {
+  usePublicDnsForTests();
+
+  let receivedHeaders;
+
+  global.fetch = async (url, options) => {
+    receivedHeaders = options.headers;
+    return mockImageResponse();
+  };
+
+  const response = await handler(
+    makeEvent(
+      {
+        url: "https://cdn.example/private-image.png",
+      },
+      {
+        cookie: "session=secret-value",
+      }
+    )
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    response.headers["cache-control"],
+    "private, no-store"
+  );
+
+  assert.equal(
+    receivedHeaders.cookie,
+    "session=secret-value"
+  );
+});
+
+test("uses public caching for requests without cookies", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async () =>
+    mockImageResponse();
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/public-image.png",
+    })
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.match(
+    response.headers["cache-control"],
+    /^public,/
+  );
+});
+
+test("supports JPEG output", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async () =>
+    mockImageResponse();
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/image.png",
+      jpeg: "1",
+    })
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    response.headers["content-type"],
+    "image/jpeg"
+  );
+});
+
+test("supports grayscale output", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async () =>
+    mockImageResponse();
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/image.png",
+      bw: "1",
+    })
+  );
+
+  assert.equal(response.statusCode, 200);
+});
+
+test("supports the legacy l quality parameter", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async () =>
+    mockImageResponse();
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/image.png",
+      l: "70",
+    })
+  );
+
+  assert.equal(response.statusCode, 200);
+});
+
+test("rejects non-image upstream responses", async () => {
+  usePublicDnsForTests();
+
+  global.fetch = async () =>
+    new Response("not an image", {
+      status: 200,
+      headers: {
+        "content-type": "text/html",
+      },
+    });
+
+  const response = await handler(
+    makeEvent({
+      url: "https://cdn.example/page.html",
+    })
+  );
+
+  assert.equal(response.statusCode, 415);
+  assert.equal(
+    response.body,
+    "Upstream returned a non-image response (text/html)."
+  );
 });
