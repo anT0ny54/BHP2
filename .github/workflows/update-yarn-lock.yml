@@ -32,8 +32,8 @@ jobs:
           node-version: 22
           cache: yarn
 
-      - name: Install dependencies
-        run: yarn install --frozen-lockfile
+      - name: Install dependencies and update yarn.lock
+        run: yarn install --ignore-scripts
 
       - name: Update dependencies and yarn.lock
         run: yarn upgrade --ignore-scripts
