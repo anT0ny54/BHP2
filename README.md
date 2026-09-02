@@ -34,3 +34,19 @@ The service fetches an image, converts it to WebP or JPEG using Sharp, optionall
 
 ```bash
 npm install
+
+
+#### :department_store: **My Free DNS Server, free** <a name="dns server"></a>
+
+On [My Free DNS] you can use HaGeZi Blocklists Multi Pro + TIF.
+
+| Hagezi Blocklists | DNS-over-HTTPS |
+|:---------------|:---------------|
+| Multi Pro + TIF | `https://xdns.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` |
+
+
+## Supporting My Project
+
+If you are interested in supporting the project you can donate :
+ - Bitcoin: 1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
