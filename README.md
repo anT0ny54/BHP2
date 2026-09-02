@@ -30,11 +30,6 @@ The service fetches an image, converts it to WebP or JPEG using Sharp, optionall
 - Netlify CLI for local development
 - Sharp
 
-## Installation
-
-```bash
-npm install
-
 
 #### :department_store: **My Free DNS Server, free** <a name="dns server"></a>
 
