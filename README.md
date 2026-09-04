@@ -1,56 +1,61 @@
-# ⚡ Bandwidth Hero Proxy 2
-
-A serverless image-compression proxy for Bandwidth Hero-compatible browser extensions.
-
-The service fetches an image, converts it to WebP or JPEG using Sharp, optionally applies grayscale conversion and resizing, and returns the optimized image.
-
-## Features
-
-- WebP output by default
-- JPEG output with `jpeg=1`
-- Grayscale conversion with `bw=1`
-- Quality control
-- Maximum-width resizing
-- Manual redirect handling
-- Redirect limit
-- HTTP and HTTPS URL validation
-- Private IPv4 and IPv6 blocking
-- DNS resolution checks before each request
-- DNS-rebinding protection
-- Maximum image-size limit
-- Maximum Sharp input-pixel limit
-- CORS support
-- `/api/health` endpoint
-- Node.js native test runner
-- Netlify Functions deployment
-
-## Requirements
-
-- Node.js 18.18 or later
-- Netlify CLI for local development
-- Sharp
-
-
-#### :department_store: **My Free DNS Server, free** <a name="dns server"></a>
-
-On [My Free DNS] you can use HaGeZi Blocklists Multi Pro + TIF.
-
-| Hagezi Blocklists | DNS-over-HTTPS |
-|:---------------|:---------------|
-| Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-
-
 # ⚡ Bandwidth Hero Server
 
-> A lightweight image optimization proxy designed to reduce bandwidth usage and speed up web browsing.
+A lightweight, serverless image-compression proxy for Bandwidth Hero-compatible browser extensions.
 
-Bandwidth Hero Server fetches remote images, compresses them, and delivers optimized versions to the client. It helps reduce data consumption while improving loading performance.
+The service fetches remote images, converts them to WebP or JPEG using Sharp, optionally applies grayscale conversion and resizing, and delivers optimized versions to dramatically reduce bandwidth usage and improve loading performance.
 
-🖥️ If you want, you can see this [Bandwidth Hero](https://bhserv.netlify.app/)
+---
 
+## ✨ Features
 
-## Supporting My Project
+- **WebP output** by default (best compression)
+- **JPEG output** with `jpeg=1` parameter
+- **Grayscale conversion** with `bw=1` parameter
+- **Quality control** for fine-tuned optimization
+- **Maximum-width resizing** for responsive images
+- **Manual redirect handling** with configurable redirect limits
+- **URL validation** for HTTP and HTTPS
+- **Private IP blocking** (IPv4 and IPv6)
+- **DNS resolution checks** before each request
+- **DNS-rebinding protection** for security
+- **Image-size limits** to prevent abuse
+- **Sharp pixel limits** for memory efficiency
+- **CORS support** for cross-origin requests
+- **Health check endpoint** (`/api/health`)
+- **Node.js native test runner** for testing
+- **Netlify Functions deployment** ready
 
-If you are interested in supporting the project you can donate :
- - Bitcoin: 1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
+---
+
+## 🚀 Requirements
+
+- **Node.js** 18.18 or later
+- **Netlify CLI** for local development
+- **Sharp** for image processing
+
+---
+
+## 🔒 Recommended DNS Configuration
+
+For optimal security and ad-blocking, configure your DNS with **My Free DNS**:
+
+| Blocklist | DNS-over-HTTPS Endpoint |
+|-----------|------------------------|
+| **HaGeZi Multi Pro + TIF** | `https://freedns-six.vercel.app/api/doh/dns-query` ✅ |
+| **HaGeZi Multi Pro + TIF** | `https://dnssix.netlify.app/api/doh/dns-query` |
+
+---
+
+## 🎯 Live Demo
+
+Check out a working example of Bandwidth Hero Server in action: [bhserv.netlify.app](https://bhserv.netlify.app/)
+
+---
+
+## 💝 Support This Project
+
+If you'd like to support the development, donations are appreciated:
+
+**Bitcoin:** `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
+---
